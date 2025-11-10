@@ -3,11 +3,17 @@ name: Daily Dify Workflow (JST 06:00)
 on:
   schedule:
     - cron: '0 21 * * *'   # JST 06:00 = 前日21:00(UTC)
-  workflow_dispatch:
+  workflow_dispatch:       # 手動実行したい時だけ使う
+
+# ★重複起動を防ぐ（同じワークフローは同時に1つだけ）
+concurrency:
+  group: daily-dify-run
+  cancel-in-progress: true
 
 jobs:
   run-dify-workflow:
     runs-on: ubuntu-latest
+    timeout-minutes: 6
 
     steps:
       - name: Start workflow (get workflow_run_id)
@@ -17,8 +23,8 @@ jobs:
           DIFY_API_KEY:  ${{ secrets.DIFY_API_KEY }}    # 対象アプリの Backend API Key
         run: |
           set -euo pipefail
-          RESP=$(curl --fail-with-body --retry 3 --retry-all-errors --retry-delay 3 \
-            -sS -X POST "$DIFY_API_BASE/v1/workflows/run" \
+          # POSTは非冪等なのでリトライ禁止（重複実行の原因）
+          RESP=$(curl --fail-with-body -sS -X POST "$DIFY_API_BASE/v1/workflows/run" \
             -H "Authorization: Bearer $DIFY_API_KEY" \
             -H "Content-Type: application/json" \
             -d '{"inputs":{},"response_mode":"blocking","user":"news-cron"}')
@@ -26,7 +32,7 @@ jobs:
           RUN_ID=$(jq -r '.workflow_run_id' dify_start.json)
           test -n "$RUN_ID"
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
-          echo "Started: workflow_run_id=$RUN_ID"
+          echo "Started workflow_run_id=$RUN_ID"
 
       - name: Poll status until finished (max ~3 min)
         env:
@@ -35,8 +41,10 @@ jobs:
           RUN_ID:        ${{ steps.start.outputs.run_id }}
         run: |
           set -euo pipefail
-          for i in $(seq 1 18); do   # 10秒 x 18 = 約3分
-            RESP=$(curl --fail-with-body -sS "$DIFY_API_BASE/v1/workflows/run/$RUN_ID" \
+          # GETは冪等なので軽いリトライOK
+          for i in $(seq 1 18); do   # 10秒×18=約3分
+            RESP=$(curl --fail-with-body --retry 3 --retry-all-errors --retry-delay 2 \
+              -sS "$DIFY_API_BASE/v1/workflows/run/$RUN_ID" \
               -H "Authorization: Bearer $DIFY_API_KEY")
             echo "$RESP" > dify_status.json
             STATUS=$(jq -r '.data.status // empty' dify_status.json)
@@ -44,10 +52,8 @@ jobs:
             if [ "$STATUS" = "succeeded" ] || [ "$STATUS" = "partial-succeeded" ]; then
               exit 0
             elif [ "$STATUS" = "failed" ] || [ "$STATUS" = "stopped" ]; then
-              cat dify_status.json
-              exit 1
+              cat dify_status.json; exit 1
             fi
             sleep 10
           done
-          echo "Timeout waiting Dify result (RUN_ID=$RUN_ID)"
-          exit 124
+          echo "Timeout waiting Dify result (RUN_ID=$RUN_ID)"; exit 124
