@@ -10,19 +10,12 @@ jobs:
   run-dify-workflow:
     runs-on: ubuntu-latest
     steps:
-      - name: Run Dify workflow (blocking)
+      - name: Call Dify /v1/workflows/run
         env:
-          DIFY_API_BASE: ${{ secrets.DIFY_API_BASE }}
-          DIFY_API_KEY:  ${{ secrets.DIFY_API_KEY }}
+          DIFY_API_BASE: ${{ secrets.DIFY_API_BASE }}   # 例: https://api.dify.ai
+          DIFY_API_KEY:  ${{ secrets.DIFY_API_KEY }}    # Backend API Key
         run: |
-          set -e
           curl -sS -X POST "$DIFY_API_BASE/v1/workflows/run" \
             -H "Authorization: Bearer $DIFY_API_KEY" \
             -H "Content-Type: application/json" \
-            -d @- <<'JSON'
-          {
-            "inputs": {},
-            "response_mode": "blocking",
-            "user": "news-cron"
-          }
-JSON
+            -d '{"inputs":{},"response_mode":"blocking","user":"news-cron"}'
