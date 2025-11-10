@@ -1,0 +1,28 @@
+name: Daily Dify Workflow (JST 06:00)
+
+on:
+  schedule:
+    # GitHub Actions の cron は UTC。JST 06:00 は「前日 21:00 UTC」
+    - cron: '0 21 * * *'
+  workflow_dispatch:
+
+jobs:
+  run-dify-workflow:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run Dify workflow (blocking)
+        env:
+          DIFY_API_BASE: ${{ secrets.DIFY_API_BASE }}
+          DIFY_API_KEY:  ${{ secrets.DIFY_API_KEY }}
+        run: |
+          set -e
+          curl -sS -X POST "$DIFY_API_BASE/v1/workflows/run" \
+            -H "Authorization: Bearer $DIFY_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d @- <<'JSON'
+          {
+            "inputs": {},
+            "response_mode": "blocking",
+            "user": "news-cron"
+          }
+JSON
