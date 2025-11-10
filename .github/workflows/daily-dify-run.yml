@@ -2,20 +2,67 @@ name: Daily Dify Workflow (JST 06:00)
 
 on:
   schedule:
-    # GitHub Actions の cron は UTC。JST 06:00 は「前日 21:00 UTC」
-    - cron: '0 21 * * *'
+    - cron: "0 21 * * *"   # JST 06:00 = 前日21:00(UTC)
   workflow_dispatch:
 
 jobs:
   run-dify-workflow:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Call Dify /v1/workflows/run
+      - name: Start workflow via Dify API (get workflow_run_id)
+        id: start
         env:
           DIFY_API_BASE: ${{ secrets.DIFY_API_BASE }}   # 例: https://api.dify.ai
-          DIFY_API_KEY:  ${{ secrets.DIFY_API_KEY }}    # Backend API Key
+          DIFY_API_KEY:  ${{ secrets.DIFY_API_KEY }}    # Backend API Key（対象アプリのもの）
         run: |
-          curl -sS -X POST "$DIFY_API_BASE/v1/workflows/run" \
+          set -euo pipefail
+          # 実行開始。HTTPエラーは失敗、ネットワーク系は自動リトライ
+          RESP="$(curl --fail-with-body --retry 3 --retry-all-errors --retry-delay 3 \
+            -sS -X POST "$DIFY_API_BASE/v1/workflows/run" \
             -H "Authorization: Bearer $DIFY_API_KEY" \
             -H "Content-Type: application/json" \
-            -d '{"inputs":{},"response_mode":"blocking","user":"news-cron"}'
+            -d '{"inputs":{},"response_mode":"blocking","user":"news-cron"}')"
+          echo "$RESP" | tee dify_start.json
+
+          # workflow_run_id を抽出（jq不要：Pythonで安全にJSONパース）
+          RUN_ID=$(python3 - <<'PY'
+import json,sys
+print(json.load(open("dify_start.json"))["workflow_run_id"])
+PY
+)
+          echo "workflow_run_id=$RUN_ID"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Poll run status until finished (max ~3 min)
+        id: poll
+        env:
+          DIFY_API_BASE: ${{ secrets.DIFY_API_BASE }}
+          DIFY_API_KEY:  ${{ secrets.DIFY_API_KEY }}
+          RUN_ID:        ${{ steps.start.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          # 10秒おき×18回（約3分）で状態を確認
+          for i in $(seq 1 18); do
+            RESP="$(curl --fail-with-body -sS -X GET "$DIFY_API_BASE/v1/workflows/run/$RUN_ID" \
+              -H "Authorization: Bearer $DIFY_API_KEY")" || { echo "GET failed"; exit 1; }
+            echo "$RESP" > dify_status.json
+
+            STATUS=$(python3 - <<'PY'
+import json,sys
+print(json.load(open("dify_status.json")).get("data",{}).get("status",""))
+PY
+)
+            echo "[$(date -u +%T)] status=$STATUS"
+            if [ "$STATUS" = "succeeded" ] || [ "$STATUS" = "partial-succeeded" ]; then
+              echo "Dify workflow succeeded."
+              exit 0
+            elif [ "$STATUS" = "failed" ] || [ "$STATUS" = "stopped" ]; then
+              echo "Dify workflow $STATUS"
+              cat dify_status.json
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "Timeout waiting Dify result (RUN_ID=$RUN_ID)"
+          exit 124
