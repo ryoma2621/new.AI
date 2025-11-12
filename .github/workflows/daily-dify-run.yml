@@ -2,10 +2,9 @@ name: Daily Dify Workflow (JST 06:00)
 
 on:
   schedule:
-    - cron: '0 21 * * *'    # JST 06:00（Actions の cron は UTC 固定）
-  workflow_dispatch:        # 手動実行したい時に使う
+    - cron: '0 21 * * *'   # JST 06:00
+  workflow_dispatch:
 
-# 同時二重起動を自動キャンセル
 concurrency:
   group: daily-dify-run
   cancel-in-progress: true
@@ -13,42 +12,76 @@ concurrency:
 jobs:
   run-dify-workflow:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 10
 
     steps:
-      - name: Call Dify /v1/workflows/run (streaming, no-retry)
+      - name: Call Dify /v1/workflows/run
+        id: start
         env:
-          DIFY_API_BASE: ${{ secrets.DIFY_API_BASE }}  # 例: https://api.dify.ai
-          DIFY_API_KEY:  ${{ secrets.DIFY_API_KEY }}   # 対象アプリの Backend API Key
+          DIFY_API_BASE: ${{ secrets.DIFY_API_BASE }}
+          DIFY_API_KEY:  ${{ secrets.DIFY_API_KEY }}
         run: |
           set -euo pipefail
-
-          # POST は非冪等。1回だけ叩く（--retry は付けない）
-          # streaming は Cloudflare のタイムアウト回避に有効
           HTTP_CODE=$(curl -sS -X POST "$DIFY_API_BASE/v1/workflows/run" \
             -H "Authorization: Bearer $DIFY_API_KEY" \
             -H "Content-Type: application/json" \
-            -d '{"inputs":{},"response_mode":"streaming","user":"news-cron"}' \
-            -o response.sse \
-            -w '%{http_code}')
-
+            -d '{"inputs":{},"response_mode":"blocking","user":"news-cron"}' \
+            -w '%{http_code}' -o dify_resp.json)
           echo "HTTP_CODE=$HTTP_CODE"
-          # 200 なら OK（SSE なので本文は response.sse に保存）
-          if [ "$HTTP_CODE" = "200" ]; then
-            echo "Dify accepted request in streaming mode."
-            # 任意: 軽く待ってから終了（念のため）
-            sleep 3
-            exit 0
+          cat dify_resp.json
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "::error title=DifyRequestFailed::HTTP code $HTTP_CODE"
+            exit 1
           fi
-
-          # 5xx は“ソフトエラー”として扱う（Dify 側は動いてLINEが届くケースがある）
-          if [ "${HTTP_CODE:0:1}" = "5" ]; then
-            echo "Warning: upstream returned $HTTP_CODE, but Dify may still be running. Marking job success to avoid duplicate runs."
-            exit 0
+          # JSON内にerrorがあるかチェック
+          ERR=$(jq -r '.error // empty' dify_resp.json)
+          if [ -n "$ERR" ]; then
+            echo "::error title=DifyErrorField::error => $ERR"
+            exit 1
           fi
+          RUN_ID=$(jq -r '.workflow_run_id // empty' dify_resp.json)
+          if [ -z "$RUN_ID" ]; then
+            echo "::error title=MissingRunID::No workflow_run_id in response"
+            exit 1
+          fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "Started workflow_run_id=$RUN_ID"
 
-          # それ以外（4xx など）は失敗扱い
-          echo "Error: unexpected HTTP $HTTP_CODE from Dify."
-          echo "---- response head ----"
-          head -c 200 response.sse || true
-          exit 1
+      - name: Poll until Dify completes
+        env:
+          DIFY_API_BASE: ${{ secrets.DIFY_API_BASE }}
+          DIFY_API_KEY:  ${{ secrets.DIFY_API_KEY }}
+          RUN_ID:        ${{ steps.start.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 12); do
+            RESP=$(curl -sS "$DIFY_API_BASE/v1/workflows/run/$RUN_ID" \
+              -H "Authorization: Bearer $DIFY_API_KEY")
+            STATUS=$(jq -r '.status // empty' <<< "$RESP")
+            echo "[$(date -u +%T)] status=$STATUS"
+            if [ "$STATUS" = "succeeded" ] || [ "$STATUS" = "partial-succeeded" ]; then
+              break
+            elif [ "$STATUS" = "failed" ] || [ "$STATUS" = "stopped" ]; then
+              echo "::error title=DifyWorkflowFailed::status= $STATUS"
+              echo "$RESP"
+              exit 1
+            fi
+            sleep 10
+          done
+
+      - name: Log summary and send LINE
+        env:
+          RUN_ID:        ${{ steps.start.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          RESP=$(curl -sS -H "Authorization: Bearer ${{ secrets.DIFY_API_KEY }}" \
+            "${{ secrets.DIFY_API_BASE }}/v1/workflows/run/${RUN_ID}")
+          COUNT=$(jq -r '.outputs.summary.count // 0' <<< "$RESP")
+          LAST=$(jq -r '.outputs.summary.last_title // "UNKNOWN"' <<< "$RESP")
+          echo "::notice title=DailyNewsSummary::件数=${COUNT}, 最終タイトル=${LAST}"
+          # 送信条件をここでもチェック
+          if [ "$COUNT" -eq 0 ] || [ "$LAST" = "UNKNOWN" ]; then
+            echo "::error title=InvalidSummary::件数=${COUNT}, 最終タイトル=${LAST}"
+            exit 1
+          fi
+          # ここに LINE 配信用の curl POST コマンドなどを入れる
